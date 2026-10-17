@@ -5,6 +5,7 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 import triton
 from torch import nn
+from torch.nn.parameter import UninitializedParameter
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -267,6 +268,10 @@ class Qwen3GatedDeltaNet(nn.Module):
             "weight_scale",
             "input_scale",
             "weight_offset",
+            # GGUF quantization exposes the packed matrix as ``qweight`` and
+            # the quant type as ``qweight_type`` instead of ``weight``.
+            "qweight",
+            "qweight_type",
         ):
             param = getattr(module, attr_name, None)
             if param is None:
@@ -281,15 +286,46 @@ class Qwen3GatedDeltaNet(nn.Module):
         """Create a weight_loader that does contiguous TP slicing for fused
         (packed-format) checkpoint weights (shard_id=None), and delegates
         to the standard MergedColumnParallelLinear loader for split checkpoint
-        weights (shard_id=int/tuple)."""
-        original_loader = module.weight.weight_loader
+        weights (shard_id=int/tuple).
+
+        GGUF: the same fused checkpoint tensor lands on ``qweight`` (packed
+        quantized bytes) plus a scalar ``qweight_type`` marker instead of
+        ``weight``.  Materialize the GGUF parameter in place and record the
+        single quant type so ``GGUFLinearMethod.apply`` takes its unsharded
+        fused-matmul path (empty ``shard_id``)."""
+        weight_param = getattr(module, "weight", None)
+        if weight_param is None:
+            weight_param = getattr(module, "qweight", None)
+        original_loader = weight_param.weight_loader
 
         def weight_loader(param, loaded_weight, loaded_shard_id=None):
+            if getattr(param, "is_gguf_weight_type", False):
+                if loaded_shard_id is None:
+                    # Single fused GGUF tensor: one quant type for the whole
+                    # matrix; the per-shard type path is unused.
+                    param.weight_type = loaded_weight.item()
+                else:
+                    original_loader(param, loaded_weight, loaded_shard_id)
+                return
             if loaded_shard_id is None:
                 # Fused checkpoint: weight is in packed (per-head-group)
                 # format. Do contiguous TP slice like ColumnParallelLinear.
                 output_dim = getattr(param, "output_dim", None)
                 group = module.tp_group
+                if (
+                    getattr(param, "is_gguf_weight", False)
+                    and isinstance(param, UninitializedParameter)
+                ):
+                    # Materialize the packed quantized tensor, TP-sliced on
+                    # the output dim like the standard GGUF linear loader.
+                    weight_shape = list(loaded_weight.shape)
+                    if (
+                        output_dim is not None
+                        and group is not None
+                        and group.world_size > 1
+                    ):
+                        weight_shape[output_dim] //= group.world_size
+                    param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
                 if (
                     output_dim is not None
                     and group is not None
@@ -867,6 +903,7 @@ class Qwen3NextModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            quant_config=quant_config,
             use_attn_tp_group=is_dp_attention_enabled(),
         )
 
@@ -1079,6 +1116,38 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def _gguf_qkvz_block_to_interleaved(
+        weight: torch.Tensor, config
+    ) -> torch.Tensor:
+        """Permute GGUF ``ssm_in`` rows from block to per-head-group order.
+
+        llama.cpp's Qwen3-Next conversion reorders ``in_proj_qkvz`` from the
+        HF per-head-group interleaved layout ``[q,k,v,z] * head_count`` into
+        block layout ``[q*heads | k*heads | v*heads | z*heads]`` (see
+        conversion/qwen.py, "corrected order"). The model consumes the
+        interleaved layout, so gather the (row-independent, GGUF-packed) rows
+        back. Valid for packed ``qweight`` rows because each quantized row is
+        self-contained (2048 elems / 256-elem super-blocks)."""
+        n_k = config.linear_num_key_heads
+        n_v = config.linear_num_value_heads
+        hk = config.linear_key_head_dim
+        hv = config.linear_value_head_dim
+        gq, gk = hk, hk
+        gv = gz = (n_v // n_k) * hv
+        q_sz = n_k * hk
+        k_sz = n_k * hk
+        v_sz = n_v * hv
+        v_off, z_off = q_sz + k_sz, q_sz + k_sz + v_sz
+        idx = []
+        for g in range(n_k):
+            idx += list(range(g * gq, (g + 1) * gq))
+            idx += list(range(q_sz + g * gk, q_sz + (g + 1) * gk))
+            idx += list(range(v_off + g * gv, v_off + (g + 1) * gv))
+            idx += list(range(z_off + g * gz, z_off + (g + 1) * gz))
+        index = torch.tensor(idx, device=weight.device, dtype=torch.long)
+        return weight[index]
+
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
@@ -1150,6 +1219,23 @@ class Qwen3NextForCausalLM(nn.Module):
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
+            # GGUF stores the GDN causal-conv weight as 2-D
+            # [conv_dim, kernel]; the model parameter is 3-D
+            # [conv_dim, 1, kernel] (see ``conv1d.weight.data.unsqueeze(1)``).
+            if (
+                name.endswith(".linear_attn.conv1d.weight")
+                and loaded_weight.dim() == 2
+            ):
+                loaded_weight = loaded_weight.unsqueeze(1)
+
+            # GGUF ``ssm_in`` (= in_proj_qkvz) arrives in llama.cpp's block
+            # row layout; the model needs the HF per-head-group interleaved
+            # layout. The ``.qweight`` suffix marks the GGUF-packed tensor.
+            if name.endswith(".linear_attn.in_proj_qkvz.qweight"):
+                loaded_weight = self._gguf_qkvz_block_to_interleaved(
+                    loaded_weight, self.config
+                )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1211,6 +1297,32 @@ class Qwen3NextForCausalLM(nn.Module):
                             f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
                         )
                         continue
+                    # GGUF: non-F32 tensors are renamed ``.weight`` →
+                    # ``.qweight`` (plus a ``.qweight_type`` marker) by the
+                    # GGUF iterator, but modules that are not converted by
+                    # the quant config (plain nn.Linear, e.g.
+                    # ``shared_expert_gate`` on CUDA) keep a plain
+                    # ``.weight`` parameter.  Redirect accordingly.
+                    if name not in params_dict and name.endswith(".qweight_type"):
+                        stem = name[: -len(".qweight_type")]
+                        if (stem + ".qweight") not in params_dict and (
+                            stem + ".weight"
+                        ) in params_dict:
+                            continue
+                    elif name not in params_dict and name.endswith(".qweight"):
+                        alt = name[: -len(".qweight")] + ".weight"
+                        if alt in params_dict:
+                            name = alt
+                            alt_param = params_dict[alt]
+                            # llama.cpp stores rank-1 linears (e.g.
+                            # shared_expert_gate) as 1-D vectors.
+                            if (
+                                alt_param.dim() > loaded_weight.dim()
+                                and alt_param.numel() == loaded_weight.numel()
+                            ):
+                                loaded_weight = loaded_weight.reshape(
+                                    alt_param.shape
+                                )
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader

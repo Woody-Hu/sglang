@@ -41,17 +41,23 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    # sgl_kernel >= 0.4 renamed moe_align_block_size to an in-place op
+    # (topk_ids, num_experts, block_size, out_sorted, out_experts, out_npp,
+    # cumsum_buffer, ...). Reuse the in-tree wrapper that adapts it to the
+    # classic (topk_ids, block_size, num_experts) -> 3-tuple contract.
+    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+        moe_align_block_size,
+    )
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -241,15 +247,25 @@ def fused_moe_gguf(
 
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
+    #
+    # The ggml_moe_a8 MMQ kernel drops blocks whose expert index is > 255
+    # (kernel-side `exp_idx > 255` early-out), so it is only safe for models
+    # with <= 255 routed experts. Larger MoEs (e.g. Qwen3-Next, 512 experts)
+    # must use the per-slot vec kernel to avoid silently losing expert
+    # contributions.
     if (
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES
         and x.shape[0] > 64
+        and w1.shape[0] <= 255
     ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
+        # sgl_kernel 0.4.x exposes ggml_moe_get_block_size as an int-only op
+        # without a Python fallback; derive the block size from the gguf
+        # package's quant-size table instead.
+        BLOCK_SIZE = gguf.GGML_QUANT_SIZES[WeightType(qweight_type)][0]
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
@@ -287,16 +303,30 @@ def fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        out = ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
-        out = act(out)
+        # ggml_moe_a8_vec launches with gridDim.z = tokens * top_k, so each
+        # call is bounded by the CUDA 65535 grid-z limit. With top_k = 10 a
+        # single 8192-token prefill chunk would exceed it (81920) and the
+        # launch fails with cudaErrorInvalidValue. Process the tokens in
+        # chunks; moe_sum overwrites (not accumulates), so chunks are
+        # independent.
+        max_chunk_tokens = 65535 // top_k
+        for start in range(0, num_tokens, max_chunk_tokens):
+            end = min(start + max_chunk_tokens, num_tokens)
+            chunk_ids = topk_ids[start:end]
+            n = end - start
 
-        out = ggml_moe_a8_vec(
-            out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
-        )
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
-        )
-        moe_sum(out, out_hidden_states)
+            out = ggml_moe_a8_vec(
+                x[start:end], w1, chunk_ids, top_k, qweight_type, N, n
+            )
+            out = act(out)
+
+            out = ggml_moe_a8_vec(
+                out, w2, chunk_ids, 1, qweight_type2, w2.shape[1], n * top_k
+            )
+            out = out.reshape(n, top_k, w2.shape[1]).mul_(
+                topk_weights[start:end].view(n, top_k, 1)
+            )
+            moe_sum(out, out_hidden_states[start:end])
     else:
         logger.warning_once(
             "There is no support for fast MoE kernel "
@@ -492,6 +522,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        # The GGUF path always runs its own fused_moe_gguf kernel; the
+        # optional fused-experts module used by other MoE methods does not
+        # exist here.
+        self.fused_experts = None
 
     def create_weights(
         self,
@@ -559,6 +593,13 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # Materialize the packed per-expert GGUF tensors collected during
+        # loading (w13: gate+up fused, w2: down).  The CUDA path keeps the
+        # packed representation — ``fused_moe_gguf`` dequantizes on the fly.
+        if hasattr(layer, "materialize_gguf_weights"):
+            layer.materialize_gguf_weights()
 
     def apply(
         self,
