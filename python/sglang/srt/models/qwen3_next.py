@@ -1116,38 +1116,6 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    @staticmethod
-    def _gguf_qkvz_block_to_interleaved(
-        weight: torch.Tensor, config
-    ) -> torch.Tensor:
-        """Permute GGUF ``ssm_in`` rows from block to per-head-group order.
-
-        llama.cpp's Qwen3-Next conversion reorders ``in_proj_qkvz`` from the
-        HF per-head-group interleaved layout ``[q,k,v,z] * head_count`` into
-        block layout ``[q*heads | k*heads | v*heads | z*heads]`` (see
-        conversion/qwen.py, "corrected order"). The model consumes the
-        interleaved layout, so gather the (row-independent, GGUF-packed) rows
-        back. Valid for packed ``qweight`` rows because each quantized row is
-        self-contained (2048 elems / 256-elem super-blocks)."""
-        n_k = config.linear_num_key_heads
-        n_v = config.linear_num_value_heads
-        hk = config.linear_key_head_dim
-        hv = config.linear_value_head_dim
-        gq, gk = hk, hk
-        gv = gz = (n_v // n_k) * hv
-        q_sz = n_k * hk
-        k_sz = n_k * hk
-        v_sz = n_v * hv
-        v_off, z_off = q_sz + k_sz, q_sz + k_sz + v_sz
-        idx = []
-        for g in range(n_k):
-            idx += list(range(g * gq, (g + 1) * gq))
-            idx += list(range(q_sz + g * gk, q_sz + (g + 1) * gk))
-            idx += list(range(v_off + g * gv, v_off + (g + 1) * gv))
-            idx += list(range(z_off + g * gz, z_off + (g + 1) * gz))
-        index = torch.tensor(idx, device=weight.device, dtype=torch.long)
-        return weight[index]
-
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
@@ -1181,6 +1149,9 @@ class Qwen3NextForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        is_gguf = self.quant_config is not None and getattr(
+            self.quant_config, "get_name", lambda: ""
+        )() == "gguf"
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             if is_mtp:
@@ -1228,13 +1199,26 @@ class Qwen3NextForCausalLM(nn.Module):
             ):
                 loaded_weight = loaded_weight.unsqueeze(1)
 
-            # GGUF ``ssm_in`` (= in_proj_qkvz) arrives in llama.cpp's block
-            # row layout; the model needs the HF per-head-group interleaved
-            # layout. The ``.qweight`` suffix marks the GGUF-packed tensor.
-            if name.endswith(".linear_attn.in_proj_qkvz.qweight"):
-                loaded_weight = self._gguf_qkvz_block_to_interleaved(
-                    loaded_weight, self.config
-                )
+            # GGUF ``ssm_in`` (= in_proj_qkvz) is already stored in the HF
+            # per-head-group interleaved layout (verified against the bf16
+            # reference shard: raw rows match, a block->interleaved gather
+            # diverges) -> no permutation on the GGUF path.
+
+            # llama.cpp applies data transforms to Qwen3-Next tensors that
+            # the model does not (see llama.cpp conversion/qwen.py); invert
+            # them on the GGUF path (both are F32):
+            #   * RMSNorm weights (except ``linear_attn.norm``) are stored
+            #     pre-shifted by +1, while the model's GemmaRMSNorm applies
+            #     x * (1 + w) -> subtract the shift back off.
+            #   * the GDN decay ``ssm_a`` is stored as -exp(A_log) while the
+            #     kernel computes -exp(A_log) -> invert with log(-x).
+            if is_gguf:
+                if name.endswith(".linear_attn.A_log"):
+                    loaded_weight = torch.log(-loaded_weight.float())
+                elif name.endswith("norm.weight") and not name.endswith(
+                    ".linear_attn.norm.weight"
+                ):
+                    loaded_weight = loaded_weight.float() - 1
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
