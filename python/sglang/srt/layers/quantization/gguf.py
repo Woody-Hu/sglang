@@ -40,6 +40,13 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
 
+# P3: expert-count ceiling for the batched MMQ MoE path. sgl-kernel 0.4.7's
+# `moe_q` kernel early-outs on `exp_idx > 255` (garbage output above that);
+# the hudi_gguf_moe extension (see tasks/qwen3next-a100/src/mmq_patch/)
+# recompiles the same kernel with the bound lifted to 65535 under a separate
+# torch namespace, leaving the installed sgl_kernel untouched.
+_MMQ_MAX_EXPERTS = 255
+
 if _is_cuda:
     from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
@@ -58,6 +65,18 @@ if _is_cuda:
     from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
         moe_align_block_size,
     )
+
+    # When the patched extension is on PYTHONPATH, take the batched MMQ path
+    # for MoEs with >255 experts (Qwen3-Next has 512).
+    try:
+        import hudi_gguf_moe  # noqa: F401
+
+        _MMQ_MAX_EXPERTS = 65535
+
+        def ggml_moe_a8(*args):  # noqa: F811
+            return torch.ops.hudi_gguf.ggml_moe_a8.default(*args)
+    except ImportError:
+        pass
 elif _is_musa:
     from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
@@ -257,15 +276,16 @@ def fused_moe_gguf(
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES
         and x.shape[0] > 64
-        and w1.shape[0] <= 255
+        and w1.shape[0] <= _MMQ_MAX_EXPERTS
     ):
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        # sgl_kernel 0.4.x exposes ggml_moe_get_block_size as an int-only op
-        # without a Python fallback; derive the block size from the gguf
-        # package's quant-size table instead.
-        BLOCK_SIZE = gguf.GGML_QUANT_SIZES[WeightType(qweight_type)][0]
+        # The MMQ kernel (moe.cuh) processes MOE_X_* = 4 token slots per
+        # expert block on CUDA (== ggml_moe_get_block_size), so the align
+        # block size is 4 — NOT the quant block size (256), which would pad
+        # expert_ids at the wrong granularity for this kernel.
+        BLOCK_SIZE = 4
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
