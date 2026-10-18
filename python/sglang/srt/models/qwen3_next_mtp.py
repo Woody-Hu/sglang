@@ -15,7 +15,9 @@
 """Inference-only Qwen3Next MTP Speculative Decoding."""
 
 import copy
+import itertools
 import logging
+import os
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
@@ -49,6 +51,17 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         config = copy.deepcopy(config)
         self.config = config
         if is_npu() and get_spec().speculative_draft_model_quantization is None:
+            quant_config = None
+        # GGUF target checkpoints contain no ``mtp.*`` tensors. When the
+        # overlay env var points at a bf16 safetensors shard holding them,
+        # keep the draft module unquantized (bf16): the weights are supplied
+        # by the overlay iterator in load_weights().
+        self._mtp_overlay = os.environ.get("SGLANG_GGUF_MTP_OVERLAY")
+        if (
+            self._mtp_overlay
+            and quant_config is not None
+            and getattr(quant_config, "get_name", lambda: "")() == "gguf"
+        ):
             quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
@@ -143,7 +156,39 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        super().load_weights(weights, is_mtp=True)
+        if self._mtp_overlay:
+            from sglang.srt.model_loader.weight_utils import (
+                safetensors_weights_iterator,
+            )
+
+            logger.info(
+                "Qwen3Next MTP: overlaying mtp.* weights from %s (bf16)",
+                self._mtp_overlay,
+            )
+            weights = itertools.chain(
+                weights,
+                safetensors_weights_iterator([self._mtp_overlay]),
+            )
+        loaded = super().load_weights(weights, is_mtp=True)
+        if self._mtp_overlay:
+            n_mtp_params = len(list(self.parameters()))
+            missing = [
+                n
+                for n, p in self.named_parameters()
+                if n not in loaded and not (n.startswith("model.embed_tokens") or n.startswith("lm_head"))
+            ]
+            # embed/lm_head are shared with the target via set_embed_and_head.
+            if missing:
+                logger.warning(
+                    "Qwen3Next MTP overlay: %d params not matched by weight names: %s",
+                    len(missing),
+                    missing[:12],
+                )
+            else:
+                logger.info(
+                    "Qwen3Next MTP overlay: all %d params matched", n_mtp_params
+                )
+        return loaded
 
 
 EntryClass = [Qwen3NextForCausalLMMTP]
