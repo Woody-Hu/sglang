@@ -1087,8 +1087,31 @@ class Qwen3NextForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
+    def _shared_quant_weight(self, module) -> torch.Tensor:
+        """Plain weight tensor for sharing with a draft model.
+
+        GGUF-quantized embedding/lm_head modules hold packed ``qweight``
+        (no ``.weight``); dequantize once (bf16) and cache on the module.
+        """
+        if hasattr(module, "weight"):
+            return module.weight
+        cached = getattr(module, "_dequant_shared_cache", None)
+        if cached is None:
+            from sglang.srt.layers.quantization.gguf import dequantize_gguf_weight
+
+            cached = dequantize_gguf_weight(
+                module.qweight,
+                module.qweight_type.weight_type,
+                dtype=torch.bfloat16,
+            )
+            module._dequant_shared_cache = cached
+        return cached
+
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        return (
+            self._shared_quant_weight(self.model.embed_tokens),
+            self._shared_quant_weight(self.lm_head),
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1102,7 +1125,7 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def get_embed(self):
-        return self.model.embed_tokens.weight
+        return self._shared_quant_weight(self.model.embed_tokens)
 
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
