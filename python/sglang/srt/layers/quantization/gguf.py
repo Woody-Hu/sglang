@@ -267,11 +267,12 @@ def fused_moe_gguf(
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     #
-    # The ggml_moe_a8 MMQ kernel drops blocks whose expert index is > 255
-    # (kernel-side `exp_idx > 255` early-out), so it is only safe for models
-    # with <= 255 routed experts. Larger MoEs (e.g. Qwen3-Next, 512 experts)
-    # must use the per-slot vec kernel to avoid silently losing expert
-    # contributions.
+    # The batched path needs `ggml_moe_a8`, whose stock form caps the expert
+    # index at 255 (kernel-side `exp_idx > 255` early-out) and so silently
+    # drops expert 256+ on a wider MoE. `_MMQ_MAX_EXPERTS` is 255 for the
+    # installed kernel; when the rebuilt `hudi_gguf_moe` op is importable
+    # (see the top of this module) it is raised to 65535, which is what lets
+    # the 512-expert Qwen3-Next route through the batched kernel at all.
     if (
         qweight_type2 in MMQ_QUANT_TYPES
         and qweight_type in MMQ_QUANT_TYPES

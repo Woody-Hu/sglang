@@ -43,14 +43,29 @@ static __device__ __forceinline__ void moe_q(
 
   const auto col_dst_0 = blockIdx.y * mmq_x;
 
+  // Both guards must run BEFORE `exp_idx` is used as an offset into the weight
+  // tensor (an out-of-range index here is an out-of-bounds read of vx):
+  //
+  //  * The grid is sized from the *buffer length* of sorted_token_ids -- see
+  //    gguf_kernel.cu, which passes `sorted_token_ids.sizes()[0]` as
+  //    `tokens_post_padded` rather than the live count -- so the trailing
+  //    block(s) sit past the blocks the align step actually filled. Their
+  //    `expert_ids` entry comes from `torch::empty` and is uninitialised.
+  //    Gate on the live count with `>=`. Upstream used `>` and therefore ran
+  //    exactly one block too many; that was harmless only because the
+  //    255-expert cap below masked the garbage index.
+  //  * The expert-index range was capped at 255 (inherited from vLLM) so that
+  //    MoEs with more routed experts silently skipped blocks instead of
+  //    reading out of bounds. Lifted to 65535 here so a 512-expert MoE
+  //    (Qwen3-Next) can use the batched kernel at all.
+  if (blockIdx.y * mmq_x >= num_tokens_post_padded[0]) return;
+  const int exp_idx = expert_ids[blockIdx.y];
+  if (exp_idx > 65535 || exp_idx < 0) return;
+
   int token_offs[mmq_x / nwarps];
   for (int i = 0; i < mmq_x; i += nwarps) {
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
   }
-
-  const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
-  if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
