@@ -214,6 +214,27 @@ def dequantize_gguf_weight(
     return ggml_dequantize(qweight, qweight_type, *shape, dtype)
 
 
+def get_gguf_dequantized_weight(
+    module: torch.nn.Module, dtype: torch.dtype
+) -> torch.Tensor:
+    """Return a dense weight for a possibly GGUF-quantized module.
+
+    GGUF-quantized embedding and lm_head modules hold packed ``qweight`` and
+    expose no ``.weight``. Speculative decoding hands the target embedding and
+    output head to the draft model, so the caller needs a dense tensor.
+    Dequantize once and cache it on the module.
+    """
+    if hasattr(module, "weight"):
+        return module.weight
+    cached = getattr(module, "_gguf_dequantized_weight", None)
+    if cached is None:
+        cached = dequantize_gguf_weight(
+            module.qweight, module.qweight_type.weight_type, dtype
+        )
+        module._gguf_dequantized_weight = cached
+    return cached
+
+
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
