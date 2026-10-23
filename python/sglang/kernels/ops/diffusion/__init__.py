@@ -793,6 +793,9 @@ _EXPORTS: dict[str, str] = {
     # Attention: non-causal dense prefill written straight to [B, H, S, D]
     "can_use_flash_attn_dense": "attention.flash_attn_dense_triton",
     "flash_attn_dense": "attention.flash_attn_dense_triton",
+    # Plain bf16 GEMM for the projections rocBLAS still owns
+    "can_use_bf16_gemm": "gemm.bf16_gemm_triton",
+    "bf16_gemm": "gemm.bf16_gemm_triton",
     "quantize_flux3_nvfp4_activation": "gemm.flux3_nvfp4_prims_ts",
     # Data movement: bitwise identical to the aten chains they replace
     "can_use_fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",

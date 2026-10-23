@@ -14,7 +14,9 @@ from sglang.kernels.ops.diffusion import (
     can_use_qkv_projection_permuted,
     fused_complex_rope,
     fused_layernorm_modulate,
+    can_use_bf16_gemm,
     can_use_flash_attn_dense,
+    bf16_gemm,
     flash_attn_dense,
     fused_silu_mul_bitexact,
     qk_norm_rope_hsd,
@@ -103,6 +105,45 @@ _qkv_permuted_verified = False
 # (1.65x on this shape). Same math, different summation order, so it is opt-in.
 _FLASH_ATTN = os.environ.get("SGLANG_QWEN_IMAGE_FLASH_ATTN", "0") == "1"
 _flash_attn_logged = False
+
+# Plain bf16 Triton GEMM for the projections rocBLAS still owns. Same precision
+# class as torch.mm (bf16 in/out, fp32 accumulation); measured 1.28x / 1.38x /
+# 1.60x on out, gate/up and down at S=16384.
+_TRITON_GEMM = os.environ.get("SGLANG_QWEN_IMAGE_TRITON_GEMM", "0") == "1"
+
+
+def can_triton_project(layer):
+    """A plain unquantized bf16 projection whose forward is one dense GEMM."""
+    return (
+        _TRITON_GEMM
+        and get_tp_world_size() == 1
+        and isinstance(layer, (ColumnParallelLinear, RowParallelLinear))
+        and isinstance(layer.quant_method, UnquantizedLinearMethod)
+        and layer.bias is None
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+        and layer.weight.is_cuda
+        and layer.weight.dtype is torch.bfloat16
+        and layer.weight.is_contiguous()
+        and not torch.compiler.is_compiling()
+    )
+
+
+def triton_project(layer, x):
+    """``layer``'s GEMM through the Triton bf16 kernel; ``None`` keeps rocBLAS."""
+    if not (
+        can_triton_project(layer)
+        and x.is_contiguous()
+        and x.dtype is torch.bfloat16
+    ):
+        return None
+    weight = layer.weight
+    out_features = weight.shape[0]
+    flat = x.view(-1, x.shape[-1])
+    if not can_use_bf16_gemm(flat, weight, out_features):
+        return None
+    out = bf16_gemm(flat, weight.t(), x.new_empty(flat.shape[0], out_features))
+    return out.view(*x.shape[:-1], out_features)
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -447,7 +488,9 @@ class QwenImage21FeedForward(nn.Module):
             return comfy_kitchen_swiglu_mlp(
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
-        gate, value = self.gate_layer(x)[0], self.proj(x)[0]
+        gate, value = triton_project(self.gate_layer, x), triton_project(self.proj, x)
+        if gate is None or value is None:
+            gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
         if (
             _is_cuda
@@ -456,11 +499,13 @@ class QwenImage21FeedForward(nn.Module):
         ):
             fused = fused_silu_mul_bitexact(gate, value)
             if _SILU_MUL_FUSION.verified:
-                return self.out(fused)[0]
+                down = triton_project(self.out, fused)
+                return down if down is not None else self.out(fused)[0]
         hidden = nn.functional.silu(gate) * value
         if fused is not None:
             hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
-        return self.out(hidden)[0]
+        down = triton_project(self.out, hidden)
+        return down if down is not None else self.out(hidden)[0]
 
 
 class QwenImage21Attention(nn.Module):
@@ -959,7 +1004,11 @@ class QwenImage21Attention(nn.Module):
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
-        return self.to_out[0](cat_outputs(outputs).flatten(2))[0], prefix_outputs
+        target = cat_outputs(outputs).flatten(2)
+        projected = triton_project(self.to_out[0], target)
+        if projected is not None:
+            return projected, prefix_outputs
+        return self.to_out[0](target)[0], prefix_outputs
 
 
 class QwenImage21TransformerBlock(nn.Module):
