@@ -34,18 +34,21 @@ _HEAD_DIM = 128
 @triton.jit
 def _attn_fwd_dense(
     Q, K, V, Out,
-    S, H, qk_scale,
+    S, H, qk_scale, stride_qh, stride_kh, stride_vh,
     D: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    bh = tl.program_id(1)
-    base = bh * S * D
+    bh = tl.program_id(1)          # batch * H + head, batch is always 1 here
+    base_q = bh * stride_qh
+    base_k = bh * stride_kh
+    base_v = bh * stride_vh
+    base = bh * S * D              # output is dense [B, H, S, D]
     offs_m = pid_m * BM + tl.arange(0, BM)
     offs_d = tl.arange(0, D)
 
-    q = tl.load(Q + base + offs_m[:, None] * D + offs_d[None, :])
+    q = tl.load(Q + base_q + offs_m[:, None] * D + offs_d[None, :])
 
     m_i = tl.full([BM], float("-inf"), tl.float32)
     l_i = tl.zeros([BM], tl.float32)
@@ -53,7 +56,7 @@ def _attn_fwd_dense(
 
     offs_n = tl.arange(0, BN)
     for start_n in range(0, S, BN):
-        k_ptrs = base + (start_n + offs_n)[None, :] * D + offs_d[:, None]
+        k_ptrs = base_k + (start_n + offs_n)[None, :] * D + offs_d[:, None]
         k = tl.load(K + k_ptrs)
         qk = tl.dot(q, k) * qk_scale
 
@@ -63,7 +66,7 @@ def _attn_fwd_dense(
         l_i = l_i * alpha + tl.sum(p, 1)
         acc = acc * alpha[:, None]
 
-        v_ptrs = base + (start_n + offs_n)[:, None] * D + offs_d[None, :]
+        v_ptrs = base_v + (start_n + offs_n)[:, None] * D + offs_d[None, :]
         v = tl.load(V + v_ptrs)
         acc = tl.dot(p.to(tl.bfloat16), v, acc)
         m_i = m_new
@@ -75,7 +78,12 @@ def _attn_fwd_dense(
 
 
 def can_use_flash_attn_dense(q, k, v):
-    """q/k/v are token-major views over dense ``[B, H, S, D]`` storage."""
+    """Token-major ``[1, S, H, D]`` views whose rows inside a head are dense.
+
+    The head may live in a larger buffer (K/V carry a cached prefix in front of
+    their rows), so only the token stride and the innermost stride are pinned;
+    the head stride is passed to the kernel instead of being inferred.
+    """
     if not (q.is_cuda and q.dtype is torch.bfloat16):
         return False
     if not (k.dtype is q.dtype and v.dtype is q.dtype):
@@ -83,9 +91,9 @@ def can_use_flash_attn_dense(q, k, v):
     if not (q.shape == k.shape == v.shape and q.dim() == 4):
         return False
     batch, seq, heads, dim = q.shape
-    if dim != _HEAD_DIM or seq % _BM:
+    if batch != 1 or dim != _HEAD_DIM or seq % _BM:
         return False
-    return all(t.transpose(1, 2).is_contiguous() for t in (q, k, v))
+    return all(t.stride(-1) == 1 and t.stride(1) == dim for t in (q, k, v))
 
 
 def flash_attn_dense(q, k, v, scale=None):
@@ -97,6 +105,7 @@ def flash_attn_dense(q, k, v, scale=None):
     grid = (seq // _BM, batch * heads)
     _attn_fwd_dense[grid](
         qt, kt, vt, out, seq, heads, qk_scale,
+        qt.stride(1), kt.stride(1), vt.stride(1),
         D=dim, BM=_BM, BN=_BN, num_warps=_WARPS, num_stages=_STAGES,
     )
     return out.transpose(1, 2)
