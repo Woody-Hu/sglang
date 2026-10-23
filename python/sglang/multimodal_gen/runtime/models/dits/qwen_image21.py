@@ -14,6 +14,8 @@ from sglang.kernels.ops.diffusion import (
     can_use_qkv_projection_permuted,
     fused_complex_rope,
     fused_layernorm_modulate,
+    can_use_flash_attn_dense,
+    flash_attn_dense,
     fused_silu_mul_bitexact,
     qk_norm_rope_hsd,
     qknorm_complex_rope_cuda,
@@ -96,6 +98,10 @@ _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 _QKV_PERMUTED = os.environ.get("SGLANG_QWEN_IMAGE_QKV_PERMUTED", "0") == "1"
 _QKV_PERMUTED_TOLERANCE = 0.02
 _qkv_permuted_verified = False
+
+# Triton flash-attention replaces AOTriton for the dense target attention
+# (1.65x on this shape). Same math, different summation order, so it is opt-in.
+_FLASH_ATTN = os.environ.get("SGLANG_QWEN_IMAGE_FLASH_ATTN", "0") == "1"
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -806,6 +812,10 @@ class QwenImage21Attention(nn.Module):
 
     def attend_target(self, q, k, v, prefix_pad):
         if prefix_pad is None:
+            if _FLASH_ATTN and not torch.compiler.is_compiling() and can_use_flash_attn_dense(
+                q, k, v
+            ):
+                return flash_attn_dense(q, k, v)
             return self.target_attn(q, k, v)
         return attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad)
 

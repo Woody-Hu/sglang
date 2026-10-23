@@ -790,6 +790,9 @@ _EXPORTS: dict[str, str] = {
     "can_use_qkv_projection_permuted": "gemm.qkv_projection_permuted_triton",
     "qkv_projection_permuted": "gemm.qkv_projection_permuted_triton",
     "qk_norm_rope_hsd": "gemm.qkv_projection_permuted_triton",
+    # Attention: non-causal dense prefill written straight to [B, H, S, D]
+    "can_use_flash_attn_dense": "attention.flash_attn_dense_triton",
+    "flash_attn_dense": "attention.flash_attn_dense_triton",
     "quantize_flux3_nvfp4_activation": "gemm.flux3_nvfp4_prims_ts",
     # Data movement: bitwise identical to the aten chains they replace
     "can_use_fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
