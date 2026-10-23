@@ -102,6 +102,7 @@ _qkv_permuted_verified = False
 # Triton flash-attention replaces AOTriton for the dense target attention
 # (1.65x on this shape). Same math, different summation order, so it is opt-in.
 _FLASH_ATTN = os.environ.get("SGLANG_QWEN_IMAGE_FLASH_ATTN", "0") == "1"
+_flash_attn_logged = False
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -735,8 +736,13 @@ class QwenImage21Attention(nn.Module):
             return None
         cache = caches[0]
         prefix = cache["key"].shape[1] if cache else layouts[0]["prefix_rope"].shape[0]
+        kv_rows = prefix + seq
+        if _FLASH_ATTN:
+            # Whole blocks only: the flash-attention kernel subtracts the zero
+            # padding rows from the softmax denominator instead of masking them.
+            kv_rows += (-kv_rows) % 64
         q_buf = x.new_empty(1, self.heads, seq, self.head_dim)
-        k_buf = x.new_empty(1, self.heads, prefix + seq, self.head_dim)
+        k_buf = x.new_empty(1, self.heads, kv_rows, self.head_dim)
         v_buf = torch.empty_like(k_buf)
         qkv_projection_permuted(
             x.view(seq, width), weight_t, q_buf, k_buf, v_buf, prefix
@@ -744,13 +750,14 @@ class QwenImage21Attention(nn.Module):
         q = q_buf.transpose(1, 2)
         k_out = k_buf.transpose(1, 2)
         v_out = v_buf.transpose(1, 2)
+        tokens = slice(prefix, prefix + seq)
         if not _qkv_permuted_verified:
             _qkv_permuted_verified = self._verify_qkv_permuted(
-                x, (q, k_out[:, prefix:], v_out[:, prefix:])
+                x, (q, k_out[:, tokens], v_out[:, tokens])
             )
             if not _qkv_permuted_verified:
                 return None
-        return q, k_out[:, prefix:], v_out[:, prefix:], k_out, v_out
+        return q, k_out[:, tokens], v_out[:, tokens], k_out, v_out
 
     def _verify_qkv_permuted(self, x, got):
         """One-shot: relative error against the module projections (bf16 noise floor)."""
@@ -772,12 +779,17 @@ class QwenImage21Attention(nn.Module):
         if prefix:
             k_out[:, :prefix].copy_(kp)
             v_out[:, :prefix].copy_(vp)
+        tail = prefix + q.shape[1]
+        if k_out.shape[1] > tail:
+            k_out[:, tail:].zero_()
+            v_out[:, tail:].zero_()
         eps = self.norm_q.variance_epsilon
         seq = q.shape[1]
         qk_norm_rope_hsd(q, self.norm_q.weight, rope, 0, seq, eps, self.heads, self.head_dim)
         qk_norm_rope_hsd(
             k_out, self.norm_k.weight, rope, prefix, seq,
             self.norm_k.variance_epsilon, self.heads, self.head_dim,
+            rows=k_out.shape[1],
         )
         return q, k_out, v_out
 
@@ -810,12 +822,19 @@ class QwenImage21Attention(nn.Module):
                 return reference[0], reference[1], None, None
         return k, v, k_out, v_out
 
-    def attend_target(self, q, k, v, prefix_pad):
+    def attend_target(self, q, k, v, prefix_pad, kv_pad=0):
         if prefix_pad is None:
             if _FLASH_ATTN and not torch.compiler.is_compiling() and can_use_flash_attn_dense(
-                q, k, v
+                q, k, v, kv_pad
             ):
-                return flash_attn_dense(q, k, v)
+                global _flash_attn_logged
+                if not _flash_attn_logged:
+                    _flash_attn_logged = True
+                    logger.info(
+                        "Qwen-Image 2.1 flash attention: q=%d kv=%d heads=%d",
+                        q.shape[1], k.shape[1], q.shape[2],
+                    )
+                return flash_attn_dense(q, k, v, kv_pad=kv_pad)
             return self.target_attn(q, k, v)
         return attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad)
 
@@ -860,7 +879,11 @@ class QwenImage21Attention(nn.Module):
             cuda_permuted = self._finish_qkv_permuted(
                 kp.shape[1], rope, q, k_out, v_out, kp, vp
             )
-            return self.attend_target(*cuda_permuted, prefix_pad), prefix_output
+            return self.attend_target(
+                *cuda_permuted,
+                prefix_pad,
+                kv_pad=k_out.shape[1] - (kp.shape[1] + q.shape[1]),
+            ), prefix_output
         if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
             cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp, k_out, v_out)
             if cuda_packed is not None:

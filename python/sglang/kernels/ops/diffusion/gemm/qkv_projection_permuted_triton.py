@@ -94,6 +94,7 @@ def _qk_norm_rope_hsd(
     ROPE,
     P,
     S,
+    ROWS,
     EPS,
     D: tl.constexpr,
     BM: tl.constexpr,
@@ -109,7 +110,9 @@ def _qk_norm_rope_hsd(
     offs_s = (pid % nblk) * BM + tl.arange(0, BM)
     mask = (offs_s < S)[:, None]
     offs_d = tl.arange(0, D)
-    row = X + head * (P + S) * D + (P + offs_s)[:, None] * D + offs_d[None, :]
+    # ROWS is the physical row count per head: the buffer may be padded past
+    # P + S so the attention kernel's key/value loop stays block aligned.
+    row = X + head * ROWS * D + (P + offs_s)[:, None] * D + offs_d[None, :]
     x = tl.load(row, mask, 0.0).to(tl.float32)
     weight = tl.load(W + offs_d).to(tl.float32)
     inv = tl.rsqrt(tl.sum(x * x, axis=1) * (1.0 / D) + EPS)
@@ -176,8 +179,8 @@ def qkv_projection_permuted(x, weight_t, q_buf, k_buf, v_buf, prefix):
     return q_buf, k_buf, v_buf
 
 
-def qk_norm_rope_hsd(x, weight, rope, prefix, seq, eps, heads, head_dim):
-    """In place RMSNorm + complex RoPE on the ``[prefix:]`` rows of a dense ``[H, P+S, D]`` buffer."""
+def qk_norm_rope_hsd(x, weight, rope, prefix, seq, eps, heads, head_dim, rows=None):
+    """In place RMSNorm + complex RoPE on the ``[prefix:]`` rows of a dense ``[H, ROWS, D]`` buffer."""
     grid = (heads * triton.cdiv(seq, _NORM_ROWS),)
     _qk_norm_rope_hsd[grid](
         x,
@@ -185,6 +188,7 @@ def qk_norm_rope_hsd(x, weight, rope, prefix, seq, eps, heads, head_dim):
         rope.view(torch.float32),
         prefix,
         seq,
+        prefix + seq if rows is None else rows,
         eps,
         D=head_dim,
         BM=_NORM_ROWS,
