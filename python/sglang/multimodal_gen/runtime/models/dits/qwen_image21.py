@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 
 import torch
 from torch import nn
@@ -10,11 +11,14 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     can_use_qknorm_complex_rope_cuda,
+    can_use_qkv_projection_permuted,
     fused_complex_rope,
     fused_layernorm_modulate,
     fused_silu_mul_bitexact,
+    qk_norm_rope_hsd,
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
+    qkv_projection_permuted,
     residual_gate_add,
     rmsnorm_preserve_reduction,
     tensors_equal,
@@ -85,6 +89,13 @@ _QKV_PACK_FUSION = BitExactFusionGate(
 )
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
+
+# Quality tier, not bit exact: the Triton epilogue accumulates in the same fp32
+# but in its own reduction order, so q/k/v differ from rocBLAS in the last bf16
+# bit. Off by default; the first call measures the gap and falls back above it.
+_QKV_PERMUTED = os.environ.get("SGLANG_QWEN_IMAGE_QKV_PERMUTED", "0") == "1"
+_QKV_PERMUTED_TOLERANCE = 0.02
+_qkv_permuted_verified = False
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -682,6 +693,88 @@ class QwenImage21Attention(nn.Module):
                 return None
         return q, k, v, k_out, v_out
 
+    def _project_qkv_permuted(self, x, layouts, caches):
+        """Project Q/K/V with dense ``[H, S, D]`` epilogues; ``None`` keeps the plain path.
+
+        The block width is ``D``, so a program's columns are exactly one head and
+        the epilogue stores a dense slab; attention then gets dense q/k/v and its
+        ``contiguous()`` turns into a view. The transpose also drops the
+        token-major buffer's ``direct_copy`` per tensor. Rounding is not rocBLAS',
+        so the first call measures the gap and falls back past the tolerance.
+        """
+        global _qkv_permuted_verified
+        if not (
+            _QKV_PERMUTED
+            and not torch.compiler.is_compiling()
+            and x.shape[0] == 1
+            and len(layouts) == 1
+            and get_sp_world_size() == 1
+            and all(
+                can_project_into(layer, x)
+                for layer in (self.to_q, self.to_k, self.to_v)
+            )
+            # The first-sight check syncs the host and allocates a reference;
+            # stay on the packed path until it has run outside capture.
+            and (_qkv_permuted_verified or not torch.cuda.is_current_stream_capturing())
+        ):
+            return None
+        packed = self.packed_qkv_weight()
+        if packed is None:
+            return None
+        seq, width = x.shape[1], x.shape[-1]
+        weight_t = packed.t()
+        if not can_use_qkv_projection_permuted(
+            x.view(seq, width), weight_t, self.heads, self.head_dim
+        ):
+            return None
+        cache = caches[0]
+        prefix = cache["key"].shape[1] if cache else layouts[0]["prefix_rope"].shape[0]
+        q_buf = x.new_empty(1, self.heads, seq, self.head_dim)
+        k_buf = x.new_empty(1, self.heads, prefix + seq, self.head_dim)
+        v_buf = torch.empty_like(k_buf)
+        qkv_projection_permuted(
+            x.view(seq, width), weight_t, q_buf, k_buf, v_buf, prefix
+        )
+        q = q_buf.transpose(1, 2)
+        k_out = k_buf.transpose(1, 2)
+        v_out = v_buf.transpose(1, 2)
+        if not _qkv_permuted_verified:
+            _qkv_permuted_verified = self._verify_qkv_permuted(
+                x, (q, k_out[:, prefix:], v_out[:, prefix:])
+            )
+            if not _qkv_permuted_verified:
+                return None
+        return q, k_out[:, prefix:], v_out[:, prefix:], k_out, v_out
+
+    def _verify_qkv_permuted(self, x, got):
+        """One-shot: relative error against the module projections (bf16 noise floor)."""
+        worst = 0.0
+        for layer, out in zip((self.to_q, self.to_k, self.to_v), got, strict=True):
+            ref = layer(x)[0].unflatten(-1, (self.heads, self.head_dim))
+            scale = ref.abs().max().clamp_min(1e-6)
+            worst = max(worst, ((out.float() - ref.float()).abs().max() / scale).item())
+        ok = worst <= _QKV_PERMUTED_TOLERANCE
+        logger.info(
+            "Qwen-Image 2.1 permuted QKV epilogue: relative max error %.4f -> %s",
+            worst,
+            "kept" if ok else "falling back to the packed token-major projection",
+        )
+        return ok
+
+    def _finish_qkv_permuted(self, prefix, rope, q, k_out, v_out, kp, vp):
+        """Prefix rows into the permuted buffers, then RMSNorm + RoPE in place."""
+        if prefix:
+            k_out[:, :prefix].copy_(kp)
+            v_out[:, :prefix].copy_(vp)
+        eps = self.norm_q.variance_epsilon
+        seq = q.shape[1]
+        qk_norm_rope_hsd(q, self.norm_q.weight, rope, 0, seq, eps, self.heads, self.head_dim)
+        qk_norm_rope_hsd(
+            k_out, self.norm_k.weight, rope, prefix, seq,
+            self.norm_k.variance_epsilon, self.heads, self.head_dim,
+        )
+        return q, k_out, v_out
+
     def _project_kv_into_buffers(self, x, layouts, caches):
         """Project K/V straight into ``[1, P+S, H, D]`` buffers; ``None`` keeps the plain path."""
         if not (
@@ -728,6 +821,7 @@ class QwenImage21Attention(nn.Module):
         k_out=None,
         v_out=None,
         prefix_pad=None,
+        permuted=False,
     ):
         if cache:
             kp, vp = cache["key"], cache["value"]
@@ -752,6 +846,11 @@ class QwenImage21Attention(nn.Module):
             prefix_output = self.to_out[0](cat_outputs(outputs, dim=1).flatten(2))[0]
             if cache is not None:
                 cache.update(key=kp, value=vp)
+        if permuted:
+            cuda_permuted = self._finish_qkv_permuted(
+                kp.shape[1], rope, q, k_out, v_out, kp, vp
+            )
+            return self.attend_target(*cuda_permuted, prefix_pad), prefix_output
         if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
             cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp, k_out, v_out)
             if cuda_packed is not None:
@@ -796,7 +895,10 @@ class QwenImage21Attention(nn.Module):
 
     def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
         # batch target projections while retaining each sample's unpadded prefix
-        packed = self._project_qkv_packed(x, layouts, caches)
+        packed = self._project_qkv_permuted(x, layouts, caches)
+        permuted = packed is not None
+        if not permuted:
+            packed = self._project_qkv_packed(x, layouts, caches)
         if packed is not None:
             q, k, v, k_out, v_out = packed
         else:
@@ -820,6 +922,7 @@ class QwenImage21Attention(nn.Module):
                 k_out=k_out,
                 v_out=v_out,
                 prefix_pad=prefix_pad,
+                permuted=permuted,
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)

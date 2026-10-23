@@ -787,6 +787,9 @@ _EXPORTS: dict[str, str] = {
     "flux3_nvfp4_linear_swiglu": "gemm.flux3_nvfp4_prims_ts",
     "flux3_nvfp4_linear_swiglu_fp4": "gemm.flux3_nvfp4_prims_ts",
     "flux3_nvfp4_qkv_qknorm_rope": "gemm.flux3_nvfp4_prims_ts",
+    "can_use_qkv_projection_permuted": "gemm.qkv_projection_permuted_triton",
+    "qkv_projection_permuted": "gemm.qkv_projection_permuted_triton",
+    "qk_norm_rope_hsd": "gemm.qkv_projection_permuted_triton",
     "quantize_flux3_nvfp4_activation": "gemm.flux3_nvfp4_prims_ts",
     # Data movement: bitwise identical to the aten chains they replace
     "can_use_fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
